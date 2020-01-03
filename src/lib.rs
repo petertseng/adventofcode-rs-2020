@@ -1,3 +1,5 @@
+pub mod day01;
+
 use std::env;
 use std::fs;
 
