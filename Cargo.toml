@@ -5,3 +5,10 @@ authors = ["Peter Tseng <pht24@cornell.edu>"]
 edition = "2021"
 
 [dependencies]
+
+[dev-dependencies]
+criterion = "0.3"
+
+[[bench]]
+name = "my_benchmark"
+harness = false
