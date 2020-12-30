@@ -3,7 +3,8 @@ use std::collections::HashMap;
 type Dim = u16;
 type Time = u16;
 type Coord = i32;
-// x and y take 5 bits and other dimensions take 4, so that's a limit of 15 dimensions.
+// x and y take 5 bits; the other dimensions take in total (1 + nrounds) * log_2(dimensions).
+// 54 / 7 is 7, so this could support up to 127 dimensions.
 type Pos = i64;
 // Since only 0, 1, 2, 3, 4+ matter, can use a u8 and saturating adds.
 // This doesn't really appear to make a performance difference though,
@@ -16,14 +17,14 @@ type CollapsedNeighMap = HashMap<Pos, Vec<(Pos, NeighCount)>>;
 
 fn step(
     now_active: &[Pos],
-    dimensions: Dim,
+    rounds: Time,
     weights: &CollapsedNeighMap,
     ybits: usize,
     wzbits: usize,
 ) -> Vec<Pos> {
     // (neighbour count << 1) | self
     let mut neigh_and_self: HashMap<Pos, NeighCount> = HashMap::new();
-    let wzshift = wzbits * (usize::from(dimensions) - 2);
+    let wzshift = wzbits * (usize::from(rounds) + 1);
     let wzmask = (1_i64 << wzshift) - 1;
     let pos_per_dy = 1_i64 << wzshift;
     let pos_per_dx = pos_per_dy << ybits;
@@ -72,33 +73,42 @@ fn step(
         .collect()
 }
 
+// counting-based representation:
+// x, y, higher_dimensions
+// higher_dimensions is a count of how many of each of 0, 1, 2, ... rounds are present.
 fn compress(
     x: Coord,
     y: Coord,
-    wz: &[Coord],
+    wz: &[Time],
+    rounds: Time,
     xyoffset: Coord,
-    wzoffset: Coord,
     ybits: usize,
     wzbits: usize,
 ) -> Pos {
     let xy = ((x + xyoffset) << ybits) + y + xyoffset;
-    wz.iter().fold(Pos::from(xy), |a, coord| {
-        (a << wzbits) + Pos::from(coord + wzoffset)
-    })
+    (Pos::from(xy) << ((usize::from(rounds) + 1) * wzbits))
+        + wz.iter()
+            .map(|&z| 1_i64 << ((z as usize) * wzbits))
+            .sum::<Pos>()
 }
 
 fn decompress(
     pos: Pos,
     dimensions: Dim,
+    rounds: Time,
     xyoffset: Coord,
-    wzoffset: Coord,
     ybits: usize,
     wzbits: usize,
 ) -> Vec<Coord> {
     let mut pos = pos;
     let mut coord = vec![0; usize::from(dimensions)];
-    for i in 0..dimensions - 2 {
-        coord[usize::from(i) + 2] = ((pos & ((1 << wzbits) - 1)) as Coord) - wzoffset;
+    let mut i = 2;
+    for j in 0..=rounds {
+        let n = (pos & ((1 << wzbits) - 1)) as Coord;
+        for _ in 0..n {
+            coord[i] = Coord::from(j);
+            i += 1;
+        }
         pos >>= wzbits;
     }
     // y
@@ -116,7 +126,7 @@ fn neigh_weights(dimensions: Dim, rounds: Time, wzbits: usize) -> CollapsedNeigh
     // Recursive closure pattern:
     // https://stackoverflow.com/questions/16946888/is-it-possible-to-make-a-recursive-closure-in-rust
     struct BuildIfRepresentative<'s> {
-        f: &'s dyn Fn(&BuildIfRepresentative, Dim, &mut [Coord], &mut NeighMap),
+        f: &'s dyn Fn(&BuildIfRepresentative, Dim, &mut [Time], &mut NeighMap),
     }
     let build_if_representative = BuildIfRepresentative {
         f: &|build_if_rep, n, prefix, weights| {
@@ -128,7 +138,7 @@ fn neigh_weights(dimensions: Dim, rounds: Time, wzbits: usize) -> CollapsedNeigh
                 } else {
                     prefix[usize::from(n) - 1]
                 };
-                for x in last..=Coord::from(rounds) {
+                for x in last..=rounds {
                     prefix[usize::from(n)] = x;
                     (build_if_rep.f)(build_if_rep, n + 1, prefix, weights);
                 }
@@ -145,22 +155,24 @@ fn neigh_weights(dimensions: Dim, rounds: Time, wzbits: usize) -> CollapsedNeigh
 }
 
 fn neigh_weights_for(
-    pt: &[Coord],
+    pt: &[Time],
     ds: &[Vec<Coord>],
     rounds: Time,
     wzbits: usize,
     h: &mut NeighMap,
 ) {
     assert!(is_representative(pt));
-    let comp_pt = compress(0, 0, pt, 0, 1, 0, wzbits);
+    let comp_pt = compress(0, 0, pt, rounds, 0, 0, wzbits);
     for d in ds {
-        let npt: Vec<_> = (0..pt.len()).map(|i| pt[i] + d[i]).collect();
+        let npt: Vec<_> = (0..pt.len()).map(|i| Coord::from(pt[i]) + d[i]).collect();
         // points with any coordinate equal to # rounds only appear in the last iteration,
         // so we don't need to compute their outgoing neighbours
         if npt.iter().any(|n| n.abs() >= Coord::from(rounds)) {
             continue;
         }
-        let comp_neigh_rep = compress(0, 0, &representative(&npt), 0, 1, 0, wzbits);
+        // sorting not needed since counting compression is ordering-invariant
+        let rep: Vec<_> = npt.iter().map(|c| c.abs() as Time).collect();
+        let comp_neigh_rep = compress(0, 0, &rep, rounds, 0, 0, wzbits);
         *h.entry(comp_neigh_rep)
             .or_insert_with(HashMap::new)
             .entry(comp_pt)
@@ -168,18 +180,7 @@ fn neigh_weights_for(
     }
 }
 
-fn representative(pt: &[Coord]) -> Vec<Coord> {
-    let mut pt: Vec<_> = pt.iter().map(|a| a.abs()).collect();
-    pt.sort_unstable();
-    pt
-}
-
-fn is_representative(pt: &[Coord]) -> bool {
-    for &c in pt {
-        if c < 0 {
-            return false;
-        }
-    }
+fn is_representative(pt: &[Time]) -> bool {
     for i in 1..pt.len() {
         if pt[i - 1] > pt[i] {
             return false;
@@ -188,28 +189,22 @@ fn is_representative(pt: &[Coord]) -> bool {
     true
 }
 
-fn size(compressed: &[Pos], dimensions: Dim, wzbits: usize) -> u64 {
+fn size(compressed: &[Pos], dimensions: Dim, rounds: Time, wzbits: usize) -> u64 {
     let perms_wz: u64 = (1..=u64::from(dimensions - 2)).product();
-
     compressed
         .iter()
         .map(|pos| {
             let mut count = 1_u64;
-            let mut tmppos = *pos;
-            let mut tally = HashMap::new();
-            for _ in 0..dimensions - 2 {
-                let coord = tmppos & ((1 << wzbits) - 1);
-                *tally.entry(coord).or_insert(0) += 1;
-                if coord != 1 {
-                    count *= 2;
+            let mut perms_pos = 1_u64;
+            for i in 0..=rounds {
+                let shifted = pos >> (wzbits * usize::from(i));
+                let count_of_i = shifted & ((1 << wzbits) - 1);
+                if i != 0 {
+                    count <<= count_of_i;
                 }
-                tmppos >>= wzbits;
+                perms_pos *= (1_u64..=(count_of_i as u64)).product::<u64>();
             }
-            count * perms_wz
-                / tally
-                    .values()
-                    .map(|&v| (1_u64..=v).product::<u64>())
-                    .product::<u64>()
+            count * perms_wz / perms_pos
         })
         .sum()
 }
@@ -290,7 +285,6 @@ fn main() {
     let active2 = active(&grid);
     let max_y = active2.iter().map(|(_, y)| *y).max().unwrap_or(0);
     let ybits = bit_width(max_y + (time as usize) * 2 + 1);
-    let wzbits = bit_width((time as usize) + 2);
 
     let dims = match dim {
         Some(d) => vec![d],
@@ -298,6 +292,8 @@ fn main() {
     };
 
     for dim in dims {
+        let wzbits = bit_width((dim as usize) - 2);
+
         let t1 = Instant::now();
         let weights = neigh_weights(dim, time, wzbits);
         let elapsed_neigh = t1.elapsed();
@@ -310,8 +306,8 @@ fn main() {
                     i32::try_from(*x).expect("input too wide"),
                     i32::try_from(*y).expect("input too tall"),
                     &zs,
+                    time,
                     i32::from(time),
-                    1,
                     ybits,
                     wzbits,
                 )
@@ -320,18 +316,18 @@ fn main() {
 
         let t2 = Instant::now();
         for _t in 1..=time {
-            active = step(&active, dim, &weights, ybits, wzbits);
+            active = step(&active, time, &weights, ybits, wzbits);
             if false {
-                println!("t={} {}", _t, size(&active, dim, wzbits));
+                println!("t={} {}", _t, size(&active, dim, time, wzbits));
                 println!("t={} {:?}", _t, active);
                 let coord: Vec<_> = active
                     .iter()
-                    .map(|&pos| decompress(pos, dim, i32::from(time), 1, ybits, wzbits))
+                    .map(|&pos| decompress(pos, dim, time, i32::from(time), ybits, wzbits))
                     .collect();
                 println!("{:?}", coord);
             }
         }
-        println!("{}", size(&active, dim, wzbits));
+        println!("{}", size(&active, dim, time, wzbits));
         let elapsed_tot = t1.elapsed();
         let elapsed_steps = t2.elapsed();
         if dim > 4 || verbose {
