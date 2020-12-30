@@ -121,7 +121,11 @@ fn decompress(
 fn neigh_weights(dimensions: Dim, rounds: Time, wzbits: usize) -> CollapsedNeighMap {
     let mut weights = HashMap::new();
     // 0 will be first from repeated_permutation, so drop it with [1..]
-    let ds = &repeated_permutation(&[0, -1, 1], usize::from(dimensions - 2))[1..];
+    let ds = &(if dimensions <= rounds {
+        repeated_permutation(&[0, -1, 1], usize::from(dimensions - 2))
+    } else {
+        vec![vec![]]
+    })[1..];
 
     // Recursive closure pattern:
     // https://stackoverflow.com/questions/16946888/is-it-possible-to-make-a-recursive-closure-in-rust
@@ -131,7 +135,11 @@ fn neigh_weights(dimensions: Dim, rounds: Time, wzbits: usize) -> CollapsedNeigh
     let build_if_representative = BuildIfRepresentative {
         f: &|build_if_rep, n, prefix, weights| {
             if n == dimensions - 2 {
-                neigh_weights_for(prefix, ds, rounds, wzbits, weights);
+                if dimensions <= rounds {
+                    neigh_weights_by_ds(prefix, ds, rounds, wzbits, weights);
+                } else {
+                    neigh_weights_by_count(prefix, rounds, wzbits, weights);
+                }
             } else {
                 let last = if n == 0 {
                     0
@@ -154,7 +162,7 @@ fn neigh_weights(dimensions: Dim, rounds: Time, wzbits: usize) -> CollapsedNeigh
         .collect()
 }
 
-fn neigh_weights_for(
+fn neigh_weights_by_ds(
     pt: &[Time],
     ds: &[Vec<Coord>],
     rounds: Time,
@@ -178,6 +186,78 @@ fn neigh_weights_for(
             .entry(comp_pt)
             .or_insert(0) += 1;
     }
+}
+
+fn neigh_weights_by_count(pt: &[Time], rounds: Time, wzbits: usize, h: &mut NeighMap) {
+    assert!(is_representative(pt));
+    let mut tally = vec![0; usize::from(rounds) + 1];
+    for &z in pt {
+        tally[usize::from(z)] += 1;
+    }
+    let comp_pt = compress(0, 0, pt, rounds, 0, 0, wzbits);
+    // Recursive closure pattern:
+    // https://stackoverflow.com/questions/16946888/is-it-possible-to-make-a-recursive-closure-in-rust
+    struct DecrementAndIncrement<'s> {
+        f: &'s dyn Fn(
+            &DecrementAndIncrement,
+            Time,
+            Pos,
+            NeighCount,
+            Time,
+            Time,
+            bool,
+            &mut NeighMap,
+        ),
+    }
+    let dec_and_inc = DecrementAndIncrement {
+        f: &|dec_and_inc, n, comp_so_far, mult, prev_count_minus_dec, prev_inc, all_zero, h| {
+            let count = tally[usize::from(n)];
+            for decrease in 0..=count {
+                let new_comp = comp_so_far
+                    + if n == 0 {
+                        0
+                    } else {
+                        Pos::from(prev_count_minus_dec + decrease)
+                            << ((usize::from(n) - 1) * wzbits)
+                    };
+                if n == rounds - 1 {
+                    // points with any coordinate equal to # rounds only appear in the last iteration,
+                    // so we don't need to compute their outgoing neighbours
+                    // this means we can require that increase from rounds-1 -> rounds be 0,
+                    // and require that decrease from rounds -> rounds-1 be count[rounds]
+                    let decrease_from_above = tally[usize::from(rounds)];
+                    if decrease == 0 && decrease_from_above == 0 && all_zero {
+                        continue;
+                    }
+                    let final_comp = new_comp
+                        + (Pos::from(count - decrease + prev_inc + decrease_from_above)
+                            << (usize::from(n) * wzbits));
+                    *h.entry(final_comp)
+                        .or_insert_with(HashMap::new)
+                        .entry(comp_pt)
+                        .or_insert(0) += mult * ncr(count, decrease);
+                } else {
+                    for increase in 0..=(count - decrease) {
+                        (dec_and_inc.f)(
+                            dec_and_inc,
+                            n + 1,
+                            new_comp,
+                            mult * ncr(count, decrease) * ncr(count - decrease, increase),
+                            count - decrease - increase + prev_inc,
+                            if n == 0 {
+                                increase + decrease
+                            } else {
+                                increase
+                            },
+                            all_zero && increase == 0 && decrease == 0,
+                            h,
+                        )
+                    }
+                }
+            }
+        },
+    };
+    (dec_and_inc.f)(&dec_and_inc, 0, 0, 1, 0, 0, true, h);
 }
 
 fn is_representative(pt: &[Time]) -> bool {
@@ -227,6 +307,17 @@ fn repeated_permutation<T: Copy>(xs: &[T], n: usize) -> Vec<Vec<T>> {
         n -= 1;
     }
     vs
+}
+
+fn ncr(n: Time, k: Time) -> NeighCount {
+    let mut r = 1;
+    for i in 0..NeighCount::from(k) {
+        // the division is safe and won't truncate a fraction.
+        // division by j only happens when r has been multiplied by j numbers,
+        // at least one of which must have been a multiple of j.
+        r = r * (NeighCount::from(n) - i) / (i + 1);
+    }
+    r
 }
 
 fn bit_width(n: usize) -> usize {
